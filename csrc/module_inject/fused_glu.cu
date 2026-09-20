@@ -284,10 +284,12 @@ void decode_step_graph(at::Tensor logits,
         max_len);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
-\nPYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
     m.def("decode_step", &decode_step, "fused decode step update (CUDA)");
-    \n m.def("decode_step_graph", &decode_step_graph, "graph-capturable decode step (CUDA)");
+
+    m.def("decode_step_graph", &decode_step_graph, "graph-capturable decode step (CUDA)");
     m.def("gdn_gates", &gdn_gates, "fused GDN beta/g gating (CUDA)");
     m.def("fused_silu_mul_halves",
           &fused_silu_mul_halves,
