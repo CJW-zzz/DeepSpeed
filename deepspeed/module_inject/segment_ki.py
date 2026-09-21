@@ -1,3 +1,4 @@
+# Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
 # DeepSpeed Team
@@ -100,6 +101,71 @@ def _fused_glu_forward(self, input):
     return self.down_proj(F.silu(gate_out) * up_out)
 
 
+# ─── Plan B: dual-weight forward (zero weight copies, gradient-safe) ───
+
+
+class DualWeightGluGEMV(torch.autograd.Function):
+    """silu(hidden @ gate_w.T) * (hidden @ up_w.T) reading weights directly.
+
+    Forward (b=1): custom CUDA kernel — one warp per output feature,
+    coalesced reads from both weight matrices, fp32 accumulation.
+    Forward (b>1): two cuBLAS GEMMs + elementwise activation (standard path,
+    fusion benefit is marginal at compute-bound batch sizes).
+    Backward: standard PyTorch ops (matmul/outer) — gradients flow to the
+    original gate.weight / up.weight Parameters, no copies or sync needed.
+    """
+
+    @staticmethod
+    def forward(ctx, hidden, gate_w, up_w, cuda_op):
+        # hidden: [in_f] (b=1 squeezed) or [B, in_f]
+        ctx.save_for_backward(hidden, gate_w, up_w)
+        ctx.has_cuda_op = cuda_op is not None
+        if hidden.dim() == 1 and cuda_op is not None:
+            out = torch.empty(gate_w.shape[0], dtype=hidden.dtype, device=hidden.device)
+            cuda_op.dual_gemv_silu_mul(hidden, gate_w, up_w, out)
+            return out
+        # b>1 or no CUDA op: compute with standard ops
+        gate_out = torch.matmul(hidden, gate_w.t())
+        up_out = torch.matmul(hidden, up_w.t())
+        return F.silu(gate_out) * up_out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        hidden, gate_w, up_w = ctx.saved_tensors
+        # Recompute gate/up activations (cheap: two GEMVs or GEMMs)
+        gate_out = torch.matmul(hidden, gate_w.t())
+        up_out = torch.matmul(hidden, up_w.t())
+        sig = torch.sigmoid(gate_out)
+        # silu'(x) = sigmoid(x) * (1 + x * (1 - sigmoid(x)))
+        silu_prime = sig * (1.0 + gate_out * (1.0 - sig))
+        # d(out)/d(gate_out) = silu'(gate) * up;  d(out)/d(up_out) = silu(gate)
+        grad_gate_coef = silu_prime * up_out * grad_out
+        grad_up_coef = (gate_out * sig) * grad_out
+        # Gradients w.r.t. weights: [out_f, in_f] each
+        if hidden.dim() == 1:
+            grad_gate_w = torch.outer(grad_gate_coef, hidden).view_as(gate_w)
+            grad_up_w = torch.outer(grad_up_coef, hidden).view_as(up_w)
+            grad_hidden = torch.matmul(grad_gate_coef, gate_w) + torch.matmul(grad_up_coef, up_w)
+        else:
+            grad_gate_w = torch.matmul(grad_gate_coef.t(), hidden)
+            grad_up_w = torch.matmul(grad_up_coef.t(), hidden)
+            grad_hidden = torch.matmul(grad_gate_coef, gate_w) + torch.matmul(grad_up_coef, up_w)
+        return grad_hidden, grad_gate_w, grad_up_w, None
+
+
+def _dual_weight_glu_forward(self, input):
+    """Plan B replacement forward: reads gate_proj.weight and up_proj.weight
+    directly (zero copies).  b=1 uses the fused dual-weight GEMV kernel;
+    b>1 falls through to the original projections.  Gradients flow to the
+    original Parameters through autograd.Function — train and generate share
+    the same path with no forward switching."""
+    if input.shape[0] == 1 and input.dim() == 2 and getattr(self, "_ki_dual_op", None) is not None:
+        out = DualWeightGluGEMV.apply(input.squeeze(0), self.gate_proj.weight, self.up_proj.weight, self._ki_dual_op)
+        return self.down_proj(out.unsqueeze(0))
+    # b>1 or no kernel: original forward (gradients also correct here)
+    return self.down_proj(F.silu(self.gate_proj(input)) * self.up_proj(input))
+
+
 @dataclass
 class GDNSegment:
     """A GatedDeltaNet middle segment for hybrid families (e.g. Qwen3.5).
@@ -155,7 +221,7 @@ def _fused_gdn_forward(self, hidden_states, *args, **kwargs):
     batch_size, seq_len, _ = hidden_states.shape
     use_precomputed_states = cache_params is not None and cache_params.has_previous_state(self.layer_idx)
 
-    # Fused [qkv / z / b / a] GEMM replacing the four separate projections.
+    # Fused [qkv | z | b | a] GEMM replacing the four separate projections.
     fused = torch.matmul(hidden_states, self._ki_gdn_fused_weight.transpose(-1, -2))
     key_dim, value_dim = self.key_dim, self.value_dim
     qkv_end = key_dim * 2 + value_dim
@@ -284,7 +350,7 @@ def _install_gdn_segment(seg: GDNSegment, backend: str) -> bool:
     return True
 
 
-def apply_segment_ki(model: torch.nn.Module, kernel: str = "all", backend: str = "auto") -> dict:
+def apply_segment_ki(model: torch.nn.Module, kernel: str = "all", backend: str = "auto", mode: str = "concat") -> dict:
     """Install segment kernels on ``model`` (post-AutoTP, pre-generate).
 
     ``kernel`` selects the pattern set: "fused_glu" (gated MLP), "fused_gdn"
@@ -293,11 +359,18 @@ def apply_segment_ki(model: torch.nn.Module, kernel: str = "all", backend: str =
     backend won (falls back to the torch composite oracle otherwise);
     "composite" forces the oracle path.
 
+    ``mode`` selects the GLU strategy: "concat" (Plan A — materialize a fused
+    weight copy, inference-only, no gradients) or "dual_weight" (Plan B —
+    the kernel reads gate/up weights directly, zero copies, gradient-safe
+    for train/generate co-location).
+
     Returns a small report so callers (tests, journals) can assert what was
     found and replaced without introspecting the module tree again.
     """
     if kernel not in ("fused_glu", "fused_gdn", "all"):
         raise ValueError(f"Unknown segment kernel {kernel!r}; choose from fused_glu/fused_gdn/all")
+    if mode not in ("concat", "dual_weight"):
+        raise ValueError(f"Unknown mode {mode!r}; choose from concat/dual_weight")
 
     cuda_op = None
     if backend in ("auto", "cuda") and kernel in ("fused_glu", "all"):
@@ -312,16 +385,18 @@ def apply_segment_ki(model: torch.nn.Module, kernel: str = "all", backend: str =
         segments = find_glu_segments(model)
         replaced = 0
         for seg in segments:
-            # Per-shard layout transform: gate and up are column-parallel shards
-            # sharing one input, so concatenating along dim 0 never crosses a
-            # shard boundary. A production version would fold this into the
-            # partitioning step instead of materializing a copy here.
-            fused_weight = torch.cat([seg.gate.weight.data, seg.up.weight.data], dim=0)
-            seg.parent._ki_fused_glu_weight = fused_weight
-            seg.parent._ki_fused_glu_op = cuda_op
-            seg.parent.forward = _fused_glu_forward.__get__(seg.parent, type(seg.parent))
+            if mode == "dual_weight":
+                # Plan B: kernel reads the original weights; no copies, gradients flow.
+                seg.parent._ki_dual_op = cuda_op if cuda_op is not None and hasattr(cuda_op,
+                                                                                    "dual_gemv_silu_mul") else None
+                seg.parent.forward = _dual_weight_glu_forward.__get__(seg.parent, type(seg.parent))
+            else:
+                # Plan A (concat): materialize fused weight copy (inference-only).
+                seg.parent._ki_fused_glu_weight = torch.cat([seg.gate.weight.data, seg.up.weight.data], dim=0)
+                seg.parent._ki_fused_glu_op = cuda_op
+                seg.parent.forward = _fused_glu_forward.__get__(seg.parent, type(seg.parent))
             replaced += 1
-        report["fused_glu"] = {"segments_found": len(segments), "segments_replaced": replaced}
+        report["fused_glu"] = {"segments_found": len(segments), "segments_replaced": replaced, "mode": mode}
 
     if kernel in ("fused_gdn", "all"):
         gdn_segments = find_gdn_segments(model)

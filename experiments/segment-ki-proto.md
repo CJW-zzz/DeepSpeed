@@ -771,3 +771,29 @@ segKI 通过 HybridEngineRolloutConfig(use_segki=True) 自动应用：
 - GPU kernel 差异: ~2.2%（14.28 vs 13.97 ms/step）
 - Prefill 摊余: ~10%（eager 200ms/128tok vs vLLM chunked ~50ms）
 - 剩余 ~7%: generate 调用的 Python 开销（设置/清理）
+
+## Plan B (dual-weight GEMV) 实现与验证 (2026-09-19)
+
+### 设计
+自定义 GEMV kernel 直接读 gate.weight / up.weight 两个独立矩阵——
+零权重拷贝、零同步、autograd.Function 保证梯度直达原始 Parameter。
+
+### 验证结果
+| 测试 | 结果 |
+|---|---|
+| Kernel 正确性 (bf16) | mean_rel 0.19%（bf16 精度内）✅ |
+| 梯度正确性 (fp32) | 三项梯度 max_diff = 0（精确匹配）✅ |
+| 性能 vs cuBLAS | 658 vs 670 GB/s = **1.02×（parity）** ✅ |
+| 带宽利用率 | 92% 理论峰值 ✅ |
+
+### 架构对比总结
+| | Plan A (concat) | Plan B (dual_weight) |
+|---|---|---|
+| 权重副本 | 有（需 sync） | **零** |
+| 训练梯度 | ❌ 断链 | ✅ 通畅 |
+| b=1 性能 | 93%（cuBLAS on fused） | 92%（自写 kernel） |
+| HF checkpoint | ✅ 兼容 | ✅ 兼容 |
+| AutoTP | ✅ 兼容 | ✅ 兼容 |
+| 推训切换 | 需要（forward 换回） | **零切换** |
+
+Plan B 现为 HybridEngineRolloutConfig 的默认模式。

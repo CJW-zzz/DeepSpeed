@@ -29,11 +29,13 @@ class HybridEngineRolloutConfig:
     # Apply segment-KI kernel injection to the engine's module at rollout
     # construction. Fuses comm-free projection+activation segments into
     # single GEMM+custom-kernel calls (MLP gate|up and GDN input projections).
-    # Note: fused weight copies go stale after optimizer steps; re-create
-    # the rollout (or call sync_segki_weights) after training.
     use_segki: bool = False
     segki_kernel: str = "all"  # "all" | "fused_glu" | "fused_gdn"
     segki_backend: str = "auto"  # "auto" | "cuda" | "composite"
+    # "dual_weight" (Plan B) reads gate/up weights directly — zero copies,
+    # gradient-safe for train/generate co-location.  "concat" (Plan A)
+    # materializes fused weight copies — inference-only, needs sync after training.
+    segki_mode: str = "dual_weight"  # "dual_weight" | "concat"
 
 
 class HybridEngineRollout(RolloutEngine):
@@ -54,11 +56,12 @@ class HybridEngineRollout(RolloutEngine):
 
         if cfg is not None and getattr(cfg, 'use_segki', False):
             self._segki_report = self._apply_segki(getattr(cfg, 'segki_kernel', 'all'),
-                                                   getattr(cfg, 'segki_backend', 'auto'))
+                                                   getattr(cfg, 'segki_backend', 'auto'),
+                                                   getattr(cfg, 'segki_mode', 'dual_weight'))
         else:
             self._segki_report = None
 
-    def _apply_segki(self, kernel: str, backend: str):
+    def _apply_segki(self, kernel: str, backend: str, mode: str = "dual_weight"):
         """Apply segment-KI kernel injection to the wrapped module.
 
         Returns the injection report dict, or None if the module is not
@@ -68,7 +71,7 @@ class HybridEngineRollout(RolloutEngine):
             from deepspeed.module_inject.segment_ki import apply_segment_ki
         except ImportError:
             return None
-        report = apply_segment_ki(self.engine.module, kernel=kernel, backend=backend)
+        report = apply_segment_ki(self.engine.module, kernel=kernel, backend=backend, mode=mode)
         if isinstance(report, dict) and report.get('segments_replaced', 0) == 0 \
                 and report.get('segments_found', 0) == 0:
             # No segments found: model architecture not supported, not an error

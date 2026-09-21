@@ -4,7 +4,7 @@
 // DeepSpeed Team
 
 // Native CUDA kernel for the segment-KI fused_glu op: computes
-// out = silu(hidden[:, :k]) * hidden[:, k:2k] on the fused gate/up GEMM
+// out = silu(hidden[:, :k]) * hidden[:, k:2k] on the fused gate|up GEMM
 // output without materializing chunked views. hidden is contiguous
 // [N, 2k]; out is contiguous [N, k]. Activation math runs in fp32 with a
 // single rounding to the storage dtype (torch opmath convention).
@@ -50,7 +50,7 @@ at::Tensor fused_silu_mul_halves(at::Tensor hidden)
 {
     TORCH_CHECK(hidden.is_cuda(), "fused_silu_mul_halves is CUDA-only");
     TORCH_CHECK(hidden.dim() >= 1 && hidden.size(-1) % 2 == 0,
-                "last dim must be even (gate/up layout)");
+                "last dim must be even (gate|up layout)");
     TORCH_CHECK(hidden.is_contiguous(), "hidden must be contiguous");
     auto sizes = hidden.sizes().vec();
     sizes.back() /= 2;
@@ -255,10 +255,12 @@ __global__ void decode_step_graph_kernel(const __nv_bfloat16* __restrict__ logit
     if (tid == 0) {
         int64_t best = (int64_t)s_idx[0];
         token_out[0] = best;
-        int64_t pos = write_pos[0];
-        out_buf[pos] = best;
-        int64_t new_pos = pos + 1;
+        // The output token becomes the NEXT step's input; write it one
+        // position ahead so it does not overwrite the current position
+        // (which holds the token being processed this step).
+        int64_t new_pos = write_pos[0] + 1;
         write_pos[0] = new_pos;
+        out_buf[new_pos] = best;
         if (new_pos + 1 < max_len) { mask[new_pos + 1] = true; }
     }
 }
@@ -285,13 +287,78 @@ void decode_step_graph(at::Tensor logits,
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+// ─── Plan B: dual-weight GEMV (b=1 decode) ───
+// Reads gate.weight and up.weight directly — no concat, no weight copies.
+// Each warp handles one output feature: lanes cooperatively compute two
+// dot products (gate row and up row share the same hidden vector read),
+// then applies silu(a)*b.  Memory-bound at b=1; coalesced reads achieve
+// near-peak HBM bandwidth with zero tiling or tensor-core complexity.
+
+__global__ void dual_gemv_silu_mul_kernel(const __nv_bfloat16* __restrict__ hidden,
+                                          const __nv_bfloat16* __restrict__ gate_w,
+                                          const __nv_bfloat16* __restrict__ up_w,
+                                          __nv_bfloat16* __restrict__ out,
+                                          int out_features,
+                                          int in_features)
+{
+    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    int lane = threadIdx.x & 31;
+    if (warp_id >= out_features) return;
+
+    const __nv_bfloat16* gate_row = gate_w + (long)warp_id * in_features;
+    const __nv_bfloat16* up_row = up_w + (long)warp_id * in_features;
+
+    // Each lane accumulates every 32nd element (coalesced across lanes).
+    float gate_acc = 0.0f, up_acc = 0.0f;
+    for (int i = lane; i < in_features; i += 32) {
+        float h = __bfloat162float(hidden[i]);
+        gate_acc += h * __bfloat162float(gate_row[i]);
+        up_acc += h * __bfloat162float(up_row[i]);
+    }
+
+    // Warp-level reduction for both dot products simultaneously.
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        gate_acc += __shfl_down_sync(0xffffffff, gate_acc, offset);
+        up_acc += __shfl_down_sync(0xffffffff, up_acc, offset);
+    }
+
+    if (lane == 0) {
+        float activated = SILU(gate_acc);
+        out[warp_id] = __float2bfloat16_rn(activated * up_acc);
+    }
+}
+
+void dual_gemv_silu_mul(at::Tensor hidden, at::Tensor gate_w, at::Tensor up_w, at::Tensor out)
+{
+    TORCH_CHECK(hidden.is_cuda() && hidden.scalar_type() == at::ScalarType::BFloat16,
+                "hidden must be CUDA bf16");
+    TORCH_CHECK(gate_w.is_contiguous() && up_w.is_contiguous(), "weights must be contiguous");
+    TORCH_CHECK(gate_w.size(0) == up_w.size(0) && gate_w.size(1) == up_w.size(1),
+                "gate/up weight shapes must match");
+    int out_f = (int)gate_w.size(0);
+    int in_f = (int)gate_w.size(1);
+    int warps_per_block = 8;  // 256 threads
+    int blocks = (out_f + warps_per_block - 1) / warps_per_block;
+    auto stream = at::cuda::getCurrentCUDAStream();
+    dual_gemv_silu_mul_kernel<<<blocks, warps_per_block * 32, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(hidden.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const __nv_bfloat16*>(gate_w.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const __nv_bfloat16*>(up_w.data_ptr<at::BFloat16>()),
+        reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()),
+        out_f,
+        in_f);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
     m.def("decode_step", &decode_step, "fused decode step update (CUDA)");
-
     m.def("decode_step_graph", &decode_step_graph, "graph-capturable decode step (CUDA)");
     m.def("gdn_gates", &gdn_gates, "fused GDN beta/g gating (CUDA)");
     m.def("fused_silu_mul_halves",
           &fused_silu_mul_halves,
           "fused silu(gate)*up on [N, 2k] hidden (CUDA)");
+    m.def("dual_gemv_silu_mul",
+          &dual_gemv_silu_mul,
+          "b=1 GEMV reading gate/up weights separately: silu(h*Wg)*(h*Wu) (CUDA)");
 }
