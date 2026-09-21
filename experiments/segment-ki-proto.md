@@ -797,3 +797,78 @@ segKI 通过 HybridEngineRolloutConfig(use_segki=True) 自动应用：
 | 推训切换 | 需要（forward 换回） | **零切换** |
 
 Plan B 现为 HybridEngineRolloutConfig 的默认模式。
+
+## Weight Freshness 实证测试 (2026-09-19, Plan B 最终验证)
+
+测试设计：fp32 + lr=1e-2（确保权重变化可测量且影响输出）
+
+| 检查 | 结果 |
+|---|---|
+| optimizer.step() 后权重变化 | ✅ 5/5 层 changed（diff 6e-5~5e-3） |
+| 推理读到更新后的权重 | ✅ 输出从 ' Paris...' → ' **.**...'（退化证明 live read） |
+| 第二轮训练权重继续变化 | ✅ PASS |
+| 第二轮推理反映第二轮变化 | ✅ '0000000000'（进一步退化） |
+
+**"输出变差"是最强证据**：lr=1e-2 破坏了模型——如果有过期副本
+（Plan A），推理仍会输出原始连贯文本；实际输出变为垃圾，直接
+证明推理读取的是训练刚修改的 live 权重。
+
+五层证据链完整闭环：梯度通畅 ✅ + 零切换 ✅ + 往返循环 ✅ +
+零副本 ✅ + **权重新鲜（实证）** ✅ = **colocation 完整实现**
+
+## decode_attn kernel 集成 + E2E (2026-09-20)
+
+### 正确性 ✅
+- 8/8 full-attention 层 patch 成功
+- 512-token greedy 输出正确（" Paris." 开头）
+- CUDA graph 完全兼容（write_pos 与 KV cache 共用同一 tensor）
+
+### E2E 性能（512 tok, Olympic avg of 5, RTX 4080 SUPER）
+| 路径 | tok/s | vs vLLM |
+|---|---|---|
+| DS + decode_attn | 67.7 | 88.8% |
+| DS SDPA baseline | 66.5 | 87.3% |
+| vLLM | 76.2 | 100% |
+
+### 关键发现：FLA 未安装是真正瓶颈
+decode_attn kernel 单调用快 2.7-9.2×，但 E2E 只 +1.8%：
+- 只有 8/32 层是 full-attention
+- 24 个 GDN 层跑纯 torch fallback（FLA/causal-conv1d 未安装）
+- GDN 层是 decode 时间的大头，fallback 比 FLA Triton kernel 慢很多
+
+### 下一步
+安装 FLA + causal-conv1d → GDN 层自动路由到快速路径 → 重测 E2E
+
+## FLA + causal-conv1d 安装 + 最终 E2E (2026-09-21)
+
+### 安装过程
+- flash-linear-attention 0.5.2: pip 直接安装 ✓
+- causal-conv1d: 需从源码编译（9 个 GPU arch，~30 分钟）✓
+- 修复 kwargs 泄漏：causal_conv1d_fn 不接受 use_cache → 白名单过滤 ✓
+
+### 最终 E2E（512 tok, greedy, Olympic avg of 5, 同实例）
+| 路径 | tok/s | vs vLLM |
+|---|---|---|
+| DS + segKI + decode_attn + FLA | **68.3** | **89.6%** |
+| DS + segKI + decode_attn（无 FLA） | 67.8 | 88.9% |
+| DS SDPA baseline | 66.5 | 87.3% |
+| vLLM 0.29.0 | **76.2** | 100% |
+
+### FLA 提升有限的原因
+GDN core（conv+scan）只占 GPU 时间 ~1%（nsys 实测 0.07ms/step）。
+GDN 层的时间大头是投影 GEMV（segKI 已优化），不是核心计算。
+FLA 快速路径改善的是核心计算，但核心计算本来就很小。
+
+### 全部优化累积效果
+| 优化 | 增量 |
+|---|---|
+| segKI（GLU+GDN 投影融合） | +10.3% |
+| Full-step CUDA graph | +35% |
+| decode_attn kernel | +1.8% |
+| FLA fast path | +0.7% |
+| **总计（vs HF eager baseline）** | **~3×** |
+
+### 剩余差距（68.3 vs 76.2 = 10.4%）
+- GEMV kernel 效率（cuBLAS vs vLLM 自定义）：~2-3%
+- Graph 内 kernel 间隙/调度：~3-4%
+- Prefill 差异（eager vs chunked）：~2-3%

@@ -314,6 +314,11 @@ def _install_gdn_segment(seg: GDNSegment, backend: str) -> bool:
                            parent.activation)
 
     def conv_fn_with_weights(mixed_qkv, **kw):
+        # causal_conv1d_fn does not accept HF generation kwargs; filter them
+        # the same way the scan closure does.
+        kw.pop("use_cache", None)
+        kw.pop("cu_seqlens", None)
+        kw.pop("cu_seq_lens_q", None)
         return conv_fn(mixed_qkv,
                        parent.conv1d.weight.squeeze(1),
                        parent.conv1d.bias,
@@ -404,6 +409,104 @@ def apply_segment_ki(model: torch.nn.Module, kernel: str = "all", backend: str =
         report["fused_gdn"] = {"segments_found": len(gdn_segments), "segments_replaced": gdn_replaced}
 
     return report
+
+
+# ─── Custom b=1 decode attention: replace SDPA in full-attention layers ───
+
+
+def _decode_attn_forward(self,
+                         hidden_states,
+                         position_embeddings=None,
+                         attention_mask=None,
+                         past_key_values=None,
+                         **kwargs):
+    """Replacement forward for full-attention layers: run the custom
+    decode_attn kernel at b=1, seq_len=1 instead of SDPA-with-mask (which
+    falls into the slow mem_efficient backend against the full-width static
+    cache buffer).
+
+    Everything except the attention core is a verbatim replay of the HF
+    forward (q_proj 2x-wide gate split, per-head q/k norms, RoPE, KV cache
+    update, gate multiply, o_proj), so numerics match the original path.
+    The kernel reads the valid KV length from the same GPU-resident
+    write_pos tensor the cache update writes through, keeping the whole
+    step CUDA-graph replayable."""
+    if (hidden_states.shape[0] != 1 or hidden_states.shape[1] > 1 or past_key_values is None
+            or getattr(self, "_ki_attn_op", None) is None
+            or getattr(past_key_values, "_write_position", None) is not self._ki_write_pos):
+        # Prefill, batched decode, or a non-graph cache (e.g. DynamicCache
+        # inside module.generate): the original forward is the correct path.
+        return self._ki_orig_attn_forward(hidden_states, position_embeddings, attention_mask, past_key_values,
+                                          **kwargs)
+
+    input_shape = hidden_states.shape[:-1]
+    hidden_shape = (*input_shape, -1, self.head_dim)
+
+    query_states, gate = torch.chunk(self.q_proj(hidden_states).view(*input_shape, -1, self.head_dim * 2), 2, dim=-1)
+    gate = gate.reshape(*input_shape, -1)
+
+    query_states = self.q_norm(query_states.view(hidden_shape)).transpose(1, 2)
+    key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+    value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+    cos, sin = position_embeddings
+    query_states, key_states = self._ki_rope(query_states, key_states, cos, sin)
+
+    key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
+
+    num_q_heads, num_kv_heads, head_dim = self._ki_num_q_heads, self._ki_num_kv_heads, self.head_dim
+    out = torch.empty(num_q_heads, head_dim, dtype=hidden_states.dtype, device=hidden_states.device)
+    self._ki_attn_op.decode_attn(query_states.reshape(num_q_heads, head_dim), key_states[0], value_states[0],
+                                 self._ki_write_pos, out, num_q_heads, num_kv_heads, head_dim, key_states.shape[2])
+
+    attn_output = out.view(*input_shape, -1) * torch.sigmoid(gate)
+    return self.o_proj(attn_output), None
+
+
+def install_decode_attention(model: torch.nn.Module, write_pos: torch.Tensor, cuda_op) -> int:
+    """Patch full-attention layers to use the custom decode_attn kernel.
+
+    Detection mirrors find_glu_segments: structural (q/k/v/o projections
+    plus per-head q_norm/k_norm present, q_proj carrying the 2x-wide
+    query|gate layout), cross-checked against the config's layer_types so
+    linear-attention blocks are never touched. Returns the patched count;
+    layers whose GQA ratio the kernel cannot serve are left native."""
+    if cuda_op is None or not hasattr(cuda_op, "decode_attn"):
+        return 0
+    try:
+        from transformers.models.qwen3_5.modeling_qwen3_5 import apply_rotary_pos_emb
+    except ImportError:
+        return 0
+
+    patched = 0
+    for module in model.modules():
+        projections = [getattr(module, name, None) for name in ("q_proj", "k_proj", "v_proj", "o_proj")]
+        if not all(isinstance(p, torch.nn.Linear) for p in projections):
+            continue
+        if not all(isinstance(getattr(module, name, None), torch.nn.Module) for name in ("q_norm", "k_norm")):
+            continue
+        head_dim = module.head_dim
+        num_q_heads = projections[0].out_features // (2 * head_dim)
+        num_kv_heads = projections[1].out_features // head_dim
+        if num_q_heads * head_dim * 2 != projections[0].out_features:
+            continue  # not the 2x-wide query|gate layout this forward replays
+        layer_types = getattr(getattr(module, "config", None), "layer_types", None)
+        if layer_types is not None and layer_types[module.layer_idx] != "full_attention":
+            continue
+        # Kernel contract: supported head dims and a GQA ratio that divides
+        # its 16 warps-per-block KV split.
+        if head_dim not in (64, 128, 256) or 16 % (num_q_heads // num_kv_heads) != 0:
+            continue
+        if getattr(module, "_ki_orig_attn_forward", None) is None:
+            module._ki_orig_attn_forward = module.forward
+        module._ki_attn_op = cuda_op
+        module._ki_write_pos = write_pos
+        module._ki_rope = apply_rotary_pos_emb
+        module._ki_num_q_heads = num_q_heads
+        module._ki_num_kv_heads = num_kv_heads
+        module.forward = _decode_attn_forward.__get__(module, type(module))
+        patched += 1
+    return patched
 
 
 def refresh_fused_weights(model: torch.nn.Module) -> int:

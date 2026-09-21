@@ -268,6 +268,19 @@ class HybridEngineRollout(RolloutEngine):
 
         write_pos.fill_(prompt_len)
 
+        # Replace SDPA in the full-attention layers with the custom
+        # decode_attn kernel for the b=1 decode steps (prefill and any
+        # non-graph path keep the original forward). Must happen before the
+        # warmup forwards so the captured graph records the kernel.
+        try:
+            from deepspeed.module_inject.segment_ki import install_decode_attention
+            from deepspeed.ops.module_inject import get_fused_glu_op
+            attn_op = get_fused_glu_op()
+            attn_patched = install_decode_attention(module, write_pos, attn_op) if hasattr(attn_op,
+                                                                                           "decode_attn") else 0
+        except Exception:
+            attn_patched = 0
+
         # Snapshot the GDN states right after prefill: the warmup forwards
         # advance conv/recurrent states by extra steps, so they must be
         # restored before capture or every replay starts from corrupted state.

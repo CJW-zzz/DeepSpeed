@@ -350,8 +350,206 @@ void dual_gemv_silu_mul(at::Tensor hidden, at::Tensor gate_w, at::Tensor up_w, a
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+// ─── Custom b=1 decode attention (graph-compatible, no mask) ───
+// Streams softmax(q @ K[0:pos]^T / sqrt(d)) @ V[0:pos] with GQA. The valid
+// KV length comes from a GPU-resident write_pos tensor, so the kernel is
+// CUDA-graph replayable (address fixed, only the value changes per step).
+// One block per KV head; its 8 warps split as (query head, KV chunk):
+// warp w handles query head w % q_per_kv over KV positions strided by
+// split = 8 / q_per_kv, then per-head partial online-softmax states are
+// merged through shared memory. Each lane owns a contiguous 16B slice of
+// the head dimension (HEAD_DIM/32 elements) for coalesced K/V row loads.
+
+template <int HEAD_DIM>
+__global__ void __launch_bounds__(512) decode_attn_kernel(const __nv_bfloat16* __restrict__ q,
+                                                          const __nv_bfloat16* __restrict__ K,
+                                                          const __nv_bfloat16* __restrict__ V,
+                                                          const int64_t* __restrict__ write_pos,
+                                                          __nv_bfloat16* __restrict__ out,
+                                                          int num_q_heads,
+                                                          int num_kv_heads,
+                                                          int max_len,
+                                                          float scale)
+{
+    constexpr int EPL = HEAD_DIM / 32;  // head-dim elements owned per lane
+    const int q_per_kv = num_q_heads / num_kv_heads;
+    const int warps_per_block = blockDim.x >> 5;
+    const int split = warps_per_block;  // KV chunks per query head
+
+    // One block per query head: all the block's warps split its KV range,
+    // giving enough independent streams to cover HBM latency at b=1.
+    const int q_head = blockIdx.x;
+    const int kv_head = q_head / q_per_kv;
+    const int warp_id = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int s = warp_id;
+
+    const int pos = (int)(*write_pos);  // valid KV positions: 0..pos inclusive
+
+    const __nv_bfloat16* Kg = K + (long)kv_head * max_len * HEAD_DIM;
+    const __nv_bfloat16* Vg = V + (long)kv_head * max_len * HEAD_DIM;
+
+    float q_reg[EPL];
+#pragma unroll
+    for (int e = 0; e < EPL; e++)
+        q_reg[e] = __bfloat162float(q[(long)q_head * HEAD_DIM + lane * EPL + e]);
+
+    float max_score = -INFINITY;
+    float sum_exp = 0.0f;
+    float out_reg[EPL];
+#pragma unroll
+    for (int e = 0; e < EPL; e++) out_reg[e] = 0.0f;
+
+    // UNROLL positions in flight so their K loads overlap and hide HBM latency.
+    constexpr int UNROLL = 4;
+    for (int base = s; base <= pos; base += UNROLL * split) {
+        float k_reg[UNROLL][EPL];
+        int idx[UNROLL];
+#pragma unroll
+        for (int u = 0; u < UNROLL; u++) {
+            idx[u] = base + u * split;
+            if (idx[u] <= pos) {
+                const __nv_bfloat16* krow = Kg + (long)idx[u] * HEAD_DIM;
+#pragma unroll
+                for (int e = 0; e < EPL; e++) k_reg[u][e] = __bfloat162float(krow[lane * EPL + e]);
+            }
+        }
+#pragma unroll
+        for (int u = 0; u < UNROLL; u++) {
+            if (idx[u] > pos) continue;  // uniform across the warp
+            float dot = 0.0f;
+#pragma unroll
+            for (int e = 0; e < EPL; e++) dot += q_reg[e] * k_reg[u][e];
+#pragma unroll
+            for (int off = 16; off > 0; off >>= 1) dot += __shfl_down_sync(0xffffffff, dot, off);
+            float score = __shfl_sync(0xffffffff, dot, 0) * scale;
+
+            float new_max = fmaxf(max_score, score);
+            float rescale = expf(max_score - new_max);  // 0 when max_score is still -inf
+            float weight = expf(score - new_max);
+            sum_exp = sum_exp * rescale + weight;
+#pragma unroll
+            for (int e = 0; e < EPL; e++) out_reg[e] *= rescale;
+            const __nv_bfloat16* vrow = Vg + (long)idx[u] * HEAD_DIM;
+#pragma unroll
+            for (int e = 0; e < EPL; e++)
+                out_reg[e] += weight * __bfloat162float(vrow[lane * EPL + e]);
+            max_score = new_max;
+        }
+    }
+
+    // Merge the per-chunk partial softmax states (max, sum, weighted V) in
+    // shared memory; an empty chunk contributes 0 via exp(-inf - M).
+    __shared__ float s_max[16];
+    __shared__ float s_sum[16];
+    __shared__ float s_out[16][HEAD_DIM];
+
+    s_max[warp_id] = max_score;
+    s_sum[warp_id] = sum_exp;
+#pragma unroll
+    for (int e = 0; e < EPL; e++) s_out[warp_id][lane * EPL + e] = out_reg[e];
+    __syncthreads();
+
+    if (s == 0) {  // the first chunk's warp combines all chunks for its head
+        float M = -INFINITY;
+        for (int t = 0; t < split; t++) M = fmaxf(M, s_max[t]);
+        float S = 0.0f;
+        float acc[EPL];
+#pragma unroll
+        for (int e = 0; e < EPL; e++) acc[e] = 0.0f;
+        for (int t = 0; t < split; t++) {
+            float wm = expf(s_max[t] - M);
+            S += s_sum[t] * wm;
+#pragma unroll
+            for (int e = 0; e < EPL; e++) acc[e] += s_out[t][lane * EPL + e] * wm;
+        }
+        float inv = 1.0f / S;
+#pragma unroll
+        for (int e = 0; e < EPL; e++)
+            out[(long)q_head * HEAD_DIM + lane * EPL + e] = __float2bfloat16_rn(acc[e] * inv);
+    }
+}
+
+void decode_attn(at::Tensor q,
+                 at::Tensor K,
+                 at::Tensor V,
+                 at::Tensor write_pos,
+                 at::Tensor out,
+                 int64_t num_q_heads,
+                 int64_t num_kv_heads,
+                 int64_t head_dim,
+                 int64_t max_len)
+{
+    TORCH_CHECK(q.is_cuda() && q.scalar_type() == at::ScalarType::BFloat16, "q must be CUDA bf16");
+    TORCH_CHECK(K.is_contiguous() && V.is_contiguous(), "K/V must be contiguous");
+    TORCH_CHECK(write_pos.is_cuda() && write_pos.scalar_type() == at::ScalarType::Long,
+                "write_pos must be a CUDA int64 tensor");
+    TORCH_CHECK(num_q_heads % num_kv_heads == 0,
+                "GQA requires num_q_heads divisible by num_kv_heads");
+    int q_per_kv = (int)(num_q_heads / num_kv_heads);
+    TORCH_CHECK(head_dim % 32 == 0, "head_dim must be a multiple of 32, got ", head_dim);
+    // 16 warps/block (512 threads) so each query head gets a 4-way KV split
+    // — the per-warp stream is otherwise latency-bound at these sizes. More
+    // warps than this exhaust registers with __launch_bounds__(512).
+    const int warps_per_block = 16;
+    TORCH_CHECK(warps_per_block % q_per_kv == 0,
+                "q heads per KV head (",
+                q_per_kv,
+                ") must divide ",
+                warps_per_block);
+
+    float scale = 1.0f / sqrtf((float)head_dim);
+    auto stream = at::cuda::getCurrentCUDAStream();
+    auto q_ptr = reinterpret_cast<const __nv_bfloat16*>(q.data_ptr<at::BFloat16>());
+    auto k_ptr = reinterpret_cast<const __nv_bfloat16*>(K.data_ptr<at::BFloat16>());
+    auto v_ptr = reinterpret_cast<const __nv_bfloat16*>(V.data_ptr<at::BFloat16>());
+    auto o_ptr = reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>());
+
+    switch (head_dim) {
+        case 64:
+            decode_attn_kernel<64>
+                <<<num_q_heads, warps_per_block * 32, 0, stream>>>(q_ptr,
+                                                                   k_ptr,
+                                                                   v_ptr,
+                                                                   write_pos.data_ptr<int64_t>(),
+                                                                   o_ptr,
+                                                                   (int)num_q_heads,
+                                                                   (int)num_kv_heads,
+                                                                   (int)max_len,
+                                                                   scale);
+            break;
+        case 128:
+            decode_attn_kernel<128>
+                <<<num_q_heads, warps_per_block * 32, 0, stream>>>(q_ptr,
+                                                                   k_ptr,
+                                                                   v_ptr,
+                                                                   write_pos.data_ptr<int64_t>(),
+                                                                   o_ptr,
+                                                                   (int)num_q_heads,
+                                                                   (int)num_kv_heads,
+                                                                   (int)max_len,
+                                                                   scale);
+            break;
+        case 256:
+            decode_attn_kernel<256>
+                <<<num_q_heads, warps_per_block * 32, 0, stream>>>(q_ptr,
+                                                                   k_ptr,
+                                                                   v_ptr,
+                                                                   write_pos.data_ptr<int64_t>(),
+                                                                   o_ptr,
+                                                                   (int)num_q_heads,
+                                                                   (int)num_kv_heads,
+                                                                   (int)max_len,
+                                                                   scale);
+            break;
+        default: TORCH_CHECK(false, "Unsupported head_dim: ", head_dim);
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
+    m.def("decode_attn", &decode_attn, "b=1 decode attention with GQA, graph-compatible (CUDA)");
     m.def("decode_step", &decode_step, "fused decode step update (CUDA)");
     m.def("decode_step_graph", &decode_step_graph, "graph-capturable decode step (CUDA)");
     m.def("gdn_gates", &gdn_gates, "fused GDN beta/g gating (CUDA)");
