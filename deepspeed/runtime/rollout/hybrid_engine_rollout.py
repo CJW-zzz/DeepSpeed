@@ -263,7 +263,8 @@ class HybridEngineRollout(RolloutEngine):
         static_attn[:, :, :, prompt_len] = True
 
         full_token_buf = torch.zeros(max_len, dtype=torch.long, device=device)
-        full_token_buf[:prompt_len] = prompt_ids.view(-1)
+        if batch_size == 1:
+            full_token_buf[:prompt_len] = prompt_ids.view(-1)
         full_token_buf[prompt_len] = next_token.view(-1)[0]  # first generated token
 
         write_pos.fill_(prompt_len)
@@ -345,13 +346,19 @@ class HybridEngineRollout(RolloutEngine):
                     use_cache=True,
                 )
                 static_logits = out.logits
-                if graph_op is not None:
+                # decode_step_graph kernel is b=1 only (single-sequence argmax);
+                # for b>1 the graph captures forward only and Python handles
+                # argmax + buffer updates outside the graph.
+                if graph_op is not None and batch_size == 1:
                     graph_op.decode_step_graph(static_logits[:, -1, :].contiguous(), static_token.view(batch_size, 1),
                                                write_pos, static_attn, full_token_buf)
 
             if graph_op is not None:
-                # The capture run advanced write_pos and mutated buffers;
-                # restore to the pre-decode state before the replay loop.
+                # The capture run advanced the GDN conv/recurrent states (its
+                # forward consumed static_token) and mutated write_pos; without
+                # this restore every batch size would re-feed the first decode
+                # token to the GDN layers, double-counting it and derailing the
+                # whole trajectory at b>1.
                 restore_gdn_states()
                 write_pos.fill_(prompt_len)
                 static_token.copy_(next_token)
@@ -359,7 +366,31 @@ class HybridEngineRollout(RolloutEngine):
             module._forward_pre_hooks.update(saved_pre)
             module._forward_hooks.update(saved_post)
 
-        # --- Decode loop: full-step graph > C++ loop > fused step > Python ---
+        # --- Decode loop: full-step graph (b=1) > graph+Python (b>1) > fallbacks ---
+        if graph_op is not None and batch_size > 1:
+            # Graph forward + Python argmax for b>1: the graph eliminates kernel
+            # launch overhead for the forward pass; argmax and buffer updates
+            # stay in Python (PyTorch argmax is batch-native).  The Python
+            # overhead (~50us/step) is a smaller fraction of the larger GPU
+            # workload at higher batch.
+            eos_mask = torch.zeros(batch_size, dtype=torch.bool, device=device)
+            for step in range(max_new_tokens - 1):
+                if eos_mask.all():
+                    output_ids.append(torch.full((batch_size, 1), pad_token_id, dtype=torch.long, device=device))
+                    continue
+                static_token.copy_(next_token)
+                pos = prompt_len + step
+                write_pos.fill_(pos)
+                # Reveal only the current token's own slot: the pos+1 slot has
+                # not been written yet (warmup/capture leftovers), and SDPA at
+                # b>1 attends every slot the mask reveals.
+                static_attn[:, :, :, pos] = True
+                get_accelerator().replay_graph(graph)
+                next_token = static_logits[:, -1, :].argmax(dim=-1, keepdim=True)
+                output_ids.append(next_token)
+                eos_mask |= (next_token.view(batch_size) == eos_token_id)
+            return torch.cat(output_ids, dim=1)
+
         if graph_op is not None:
             # Full-step graph: one replay = forward + argmax + buffer updates.
             # Python only does replay + periodic EOS check (every 16 steps).
@@ -423,7 +454,7 @@ class HybridEngineRollout(RolloutEngine):
             static_token.copy_(next_token)
             pos = prompt_len + step
             write_pos.fill_(pos)
-            static_attn[:, :, :, pos + 1] = True
+            static_attn[:, :, :, pos] = True
             get_accelerator().replay_graph(graph)
             next_token = static_logits[:, -1, :].argmax(dim=-1, keepdim=True)
             output_ids.append(next_token)
